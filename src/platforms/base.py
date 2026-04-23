@@ -16,6 +16,7 @@ class Event:
     url: str
     thumbnail: str | None = None
     duration_seconds: int | None = None  # for uploads
+    mentions_hit: list[str] | None = None  # names from the mention watchlist found in title
 
     @property
     def event_id(self) -> str:
@@ -24,10 +25,11 @@ class Event:
     def format_message(self) -> str:
         icon = "🔴 LIVE" if self.kind == "live" else "🎬 NEW UPLOAD"
         platform_label = self.platform.capitalize()
-        lines = [
-            f"{icon} · {platform_label}",
-            f"<b>{self.creator}</b> — {self.title}",
-        ]
+        lines = []
+        if self.mentions_hit:
+            lines.append(f"👀 <b>Mentions:</b> {', '.join(self.mentions_hit)}")
+        lines.append(f"{icon} · {platform_label}")
+        lines.append(f"<b>{self.creator}</b> — {self.title}")
         if self.kind == "upload" and self.duration_seconds:
             mins = self.duration_seconds // 60
             lines.append(f"Length: {mins} min")

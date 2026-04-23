@@ -25,6 +25,7 @@ class Config:
     min_longform_seconds: int
     dedup_window_hours: int
     channels: dict[str, list[str]] = field(default_factory=dict)
+    mentions: list[str] = field(default_factory=list)
     channels_path: Path = ROOT / "channels.yaml"
 
     def handles(self, platform: str) -> list[str]:
@@ -39,6 +40,7 @@ def load_config() -> Config:
     settings = raw.get("settings", {}) or {}
     raw_channels = raw.get("channels", {}) or {}
     channels = {p: list(raw_channels.get(p, []) or []) for p in PLATFORMS}
+    mentions = list(raw.get("mentions", []) or [])
 
     def req(key: str) -> str:
         val = os.getenv(key, "").strip()
@@ -56,6 +58,7 @@ def load_config() -> Config:
         min_longform_seconds=int(settings.get("min_longform_seconds", 600)),
         dedup_window_hours=int(settings.get("dedup_window_hours", 168)),
         channels=channels,
+        mentions=mentions,
         channels_path=channels_path,
     )
 
@@ -64,6 +67,7 @@ def save_channels(config: Config) -> None:
     """Persist channels + settings back to channels.yaml."""
     out = {
         "channels": {p: config.channels.get(p, []) for p in PLATFORMS},
+        "mentions": config.mentions,
         "settings": {
             "min_longform_seconds": config.min_longform_seconds,
             "dedup_window_hours": config.dedup_window_hours,

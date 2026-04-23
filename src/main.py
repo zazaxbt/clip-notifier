@@ -43,9 +43,15 @@ async def _poll_once(watcher: Platform, config: Config, notifier: Notifier) -> N
         db.record_status(watcher.name, ok=False, err=str(e))
         return
 
+    mentions = config.mentions or []
     for ev in events:
         if db.already_notified(ev.event_id):
             continue
+        if mentions:
+            title_lower = (ev.title or "").lower()
+            hits = [m for m in mentions if m.lower() in title_lower]
+            if hits:
+                ev.mentions_hit = hits
         await notifier.send_event(ev)
         db.mark_notified(ev.event_id)
 

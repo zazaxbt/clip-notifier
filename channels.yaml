@@ -1,10 +1,46 @@
 channels:
   youtube:
-  - Mrbeast
+    - Orangieyt
+    - TJRTrades
+    - jackneel
+    - notthreadguy
+    - UCMSYZVlQmyG8_2MkIKzg0kw   # The Iced Coffee Hour (channel ID is more stable than the handle)
+    - impaulsive
+    - PBBlakeYT
+    - UpOnly
   twitch:
-  - kai_cenat
-  kick: []
-  x: []
+    - orangieyt
+    - tjrtrades
+    - rasmrr
+    - blknoiz06
+    - pbblake
+    - cented
+    - clavicular
+  kick:
+    - tjrtrades
+    - rasmr
+    - pbblake
+  x:
+    - orangie
+    - TJRTrades
+    - jackhneel
+    - notthreadguy
+    - rasmr_eth
+    - TheICHpodcast
+    - impaulsive
+    - blknoiz06
+    - Cented7
+    - CryptoGainzy
+    - cobie
+    - UpOnlyTV
+    - MustStopMurad
+    - HsakaTrades
+    - MitchOnSOL_
+    - Clavicular0
+
+mentions:
+  - Clavicular
+
 settings:
   min_longform_seconds: 600
   dedup_window_hours: 168

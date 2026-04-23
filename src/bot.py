@@ -32,6 +32,8 @@ def register_handlers(app: Application, config: Config, notifier: Notifier) -> N
             "/list — show tracked creators\n"
             "/add <platform> <handle>\n"
             "/remove <platform> <handle>\n"
+            "/watch <name> — alert when tracked creators mention this name\n"
+            "/unwatch <name>\n"
             "/mute <minutes>\n"
             "/status — health per platform\n\n"
             f"Platforms: {', '.join(PLATFORMS)}"
@@ -86,6 +88,37 @@ def register_handlers(app: Application, config: Config, notifier: Notifier) -> N
         await update.message.reply_text(f"🗑 Removed {handle} from {platform}.")
 
     @owner
+    async def watch_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        args = ctx.args or []
+        if not args:
+            if not config.mentions:
+                await update.message.reply_text("No mention keywords. Add with /watch <name>.")
+                return
+            await update.message.reply_text("👀 Mention watchlist:\n" + "\n".join(f"• {m}" for m in config.mentions))
+            return
+        name = " ".join(args)
+        if name in config.mentions:
+            await update.message.reply_text("Already watching.")
+            return
+        config.mentions.append(name)
+        save_channels(config)
+        await update.message.reply_text(f"👀 Now watching for mentions of: {name}")
+
+    @owner
+    async def unwatch_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        args = ctx.args or []
+        if not args:
+            await update.message.reply_text("Usage: /unwatch <name>")
+            return
+        name = " ".join(args)
+        if name not in config.mentions:
+            await update.message.reply_text("Not in watchlist.")
+            return
+        config.mentions.remove(name)
+        save_channels(config)
+        await update.message.reply_text(f"Removed mention keyword: {name}")
+
+    @owner
     async def mute_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         args = ctx.args or []
         try:
@@ -119,5 +152,7 @@ def register_handlers(app: Application, config: Config, notifier: Notifier) -> N
     app.add_handler(CommandHandler("list", list_cmd))
     app.add_handler(CommandHandler("add", add_cmd))
     app.add_handler(CommandHandler("remove", remove_cmd))
+    app.add_handler(CommandHandler("watch", watch_cmd))
+    app.add_handler(CommandHandler("unwatch", unwatch_cmd))
     app.add_handler(CommandHandler("mute", mute_cmd))
     app.add_handler(CommandHandler("status", status_cmd))
