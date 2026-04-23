@@ -40,7 +40,15 @@ async def _poll_once(watcher: Platform, config: Config, notifier: Notifier) -> N
         db.record_status(watcher.name, ok=True)
     except Exception as e:
         log.exception("%s poll failed", watcher.name)
-        db.record_status(watcher.name, ok=False, err=str(e))
+        err = str(e)
+        # httpx HTTPStatusError has .response with body — capture for quota/perm diagnosis
+        resp = getattr(e, "response", None)
+        if resp is not None:
+            try:
+                err = f"{err} :: {resp.text[:300]}"
+            except Exception:
+                pass
+        db.record_status(watcher.name, ok=False, err=err)
         return
 
     mentions = config.mentions or []

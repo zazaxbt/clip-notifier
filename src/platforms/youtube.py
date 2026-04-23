@@ -1,14 +1,32 @@
-"""YouTube watcher: detects live streams and long-form uploads."""
+"""YouTube watcher using RSS feeds (free, no quota) + minimal API for classification.
+
+Quota footprint per poll cycle (8 channels):
+  - Channel-ID resolution: 0 units (scraped from @handle HTML, cached forever)
+  - Recent-video discovery: 0 units (RSS feed per channel)
+  - Classification of new IDs: 1 unit per videos.list call (batched up to 50 IDs)
+
+Well under the 10 000 unit/day default quota.
+"""
 from __future__ import annotations
 
 import re
+from xml.etree import ElementTree as ET
 
 import httpx
 
 from .base import Event, Platform
 
-API = "https://www.googleapis.com/youtube/v3"
+HANDLE_PAGE = "https://www.youtube.com/@{handle}"
+RSS_URL = "https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
+VIDEOS_API = "https://www.googleapis.com/youtube/v3/videos"
+
+CHANNEL_ID_RE = re.compile(r'"channelId":"(UC[A-Za-z0-9_\-]{22})"')
 ISO_DURATION = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+
+NS = {
+    "atom": "http://www.w3.org/2005/Atom",
+    "yt": "http://www.youtube.com/xml/schemas/2015",
+}
 
 
 def _iso_to_seconds(iso: str) -> int:
@@ -26,7 +44,7 @@ class YouTubeWatcher(Platform):
         self.api_key = api_key
         self.min_longform_seconds = min_longform_seconds
         self._channel_id_cache: dict[str, str] = {}
-        self._uploads_playlist_cache: dict[str, str] = {}
+        self._seen_video_ids: set[str] = set()
 
     async def _resolve_channel_id(self, client: httpx.AsyncClient, handle: str) -> str | None:
         if handle in self._channel_id_cache:
@@ -34,127 +52,131 @@ class YouTubeWatcher(Platform):
         if handle.startswith("UC") and len(handle) == 24:
             self._channel_id_cache[handle] = handle
             return handle
-        r = await client.get(
-            f"{API}/search",
-            params={
-                "part": "snippet",
-                "q": handle,
-                "type": "channel",
-                "maxResults": 1,
-                "key": self.api_key,
-            },
-        )
-        r.raise_for_status()
-        items = r.json().get("items", [])
-        if not items:
-            return None
-        cid = items[0]["snippet"]["channelId"]
-        self._channel_id_cache[handle] = cid
-        return cid
-
-    async def _uploads_playlist(self, client: httpx.AsyncClient, channel_id: str) -> str | None:
-        if channel_id in self._uploads_playlist_cache:
-            return self._uploads_playlist_cache[channel_id]
-        r = await client.get(
-            f"{API}/channels",
-            params={"part": "contentDetails", "id": channel_id, "key": self.api_key},
-        )
-        r.raise_for_status()
-        items = r.json().get("items", [])
-        if not items:
-            return None
-        pid = items[0]["contentDetails"]["relatedPlaylists"]["uploads"]
-        self._uploads_playlist_cache[channel_id] = pid
-        return pid
-
-    async def _check_live(
-        self, client: httpx.AsyncClient, handle: str, channel_id: str
-    ) -> list[Event]:
-        r = await client.get(
-            f"{API}/search",
-            params={
-                "part": "snippet",
-                "channelId": channel_id,
-                "eventType": "live",
-                "type": "video",
-                "maxResults": 3,
-                "key": self.api_key,
-            },
-        )
-        r.raise_for_status()
-        events: list[Event] = []
-        for item in r.json().get("items", []):
-            vid = item["id"]["videoId"]
-            sn = item["snippet"]
-            events.append(
-                Event(
-                    platform="youtube",
-                    kind="live",
-                    creator=sn.get("channelTitle", handle),
-                    title=sn.get("title", ""),
-                    url=f"https://youtube.com/watch?v={vid}",
-                    thumbnail=sn.get("thumbnails", {}).get("high", {}).get("url"),
-                )
+        try:
+            r = await client.get(
+                HANDLE_PAGE.format(handle=handle),
+                follow_redirects=True,
+                headers={"User-Agent": "Mozilla/5.0 (clip-notifier)"},
             )
-        return events
+            if r.status_code != 200:
+                return None
+            m = CHANNEL_ID_RE.search(r.text)
+            if not m:
+                return None
+            cid = m.group(1)
+            self._channel_id_cache[handle] = cid
+            return cid
+        except Exception:
+            return None
 
-    async def _check_uploads(
-        self, client: httpx.AsyncClient, handle: str, channel_id: str
-    ) -> list[Event]:
-        playlist_id = await self._uploads_playlist(client, channel_id)
-        if not playlist_id:
+    async def _fetch_rss(
+        self, client: httpx.AsyncClient, channel_id: str
+    ) -> list[tuple[str, str, str]]:
+        """Return (video_id, title, channel_title) tuples for recent entries."""
+        try:
+            r = await client.get(RSS_URL.format(channel_id=channel_id))
+            if r.status_code != 200:
+                return []
+            root = ET.fromstring(r.text)
+        except Exception:
             return []
-        r = await client.get(
-            f"{API}/playlistItems",
-            params={
-                "part": "snippet,contentDetails",
-                "playlistId": playlist_id,
-                "maxResults": 5,
-                "key": self.api_key,
-            },
-        )
-        r.raise_for_status()
-        items = r.json().get("items", [])
-        if not items:
-            return []
-        video_ids = [i["contentDetails"]["videoId"] for i in items]
-
-        d = await client.get(
-            f"{API}/videos",
-            params={"part": "contentDetails,snippet", "id": ",".join(video_ids), "key": self.api_key},
-        )
-        d.raise_for_status()
-        meta = {v["id"]: v for v in d.json().get("items", [])}
-
-        events: list[Event] = []
-        for vid in video_ids:
-            v = meta.get(vid)
-            if not v:
+        ct_elem = root.find("atom:title", NS)
+        channel_title = ct_elem.text if ct_elem is not None else ""
+        out: list[tuple[str, str, str]] = []
+        for entry in root.findall("atom:entry", NS):
+            vid = entry.find("yt:videoId", NS)
+            title = entry.find("atom:title", NS)
+            if vid is None or title is None or not vid.text:
                 continue
-            dur = _iso_to_seconds(v["contentDetails"]["duration"])
-            if dur < self.min_longform_seconds:
-                continue
-            events.append(
-                Event(
-                    platform="youtube",
-                    kind="upload",
-                    creator=v["snippet"].get("channelTitle", handle),
-                    title=v["snippet"].get("title", ""),
-                    url=f"https://youtube.com/watch?v={vid}",
-                    duration_seconds=dur,
+            out.append((vid.text, title.text or "", channel_title or ""))
+        return out
+
+    async def _classify(
+        self, client: httpx.AsyncClient, video_ids: list[str]
+    ) -> dict[str, dict]:
+        """Batch-classify video IDs via videos.list (1 unit per call, up to 50 IDs)."""
+        if not video_ids or not self.api_key:
+            return {}
+        out: dict[str, dict] = {}
+        for i in range(0, len(video_ids), 50):
+            chunk = video_ids[i : i + 50]
+            try:
+                r = await client.get(
+                    VIDEOS_API,
+                    params={
+                        "part": "snippet,contentDetails,liveStreamingDetails",
+                        "id": ",".join(chunk),
+                        "key": self.api_key,
+                    },
                 )
-            )
-        return events
+                r.raise_for_status()
+                for item in r.json().get("items", []):
+                    out[item["id"]] = item
+            except Exception:
+                continue
+        return out
 
     async def poll(self, handles: list[str]) -> list[Event]:
-        if not self.api_key or not handles:
+        if not handles:
             return []
-        out: list[Event] = []
+
         async with httpx.AsyncClient(timeout=20) as client:
-            for handle in handles:
-                cid = await self._resolve_channel_id(client, handle)
-                if not cid:
+            # Resolve handles → channel IDs (free, cached)
+            cid_by_handle: dict[str, str] = {}
+            for h in handles:
+                cid = await self._resolve_channel_id(client, h)
+                if cid:
+                    cid_by_handle[h] = cid
+
+            # Collect new video IDs via RSS (free)
+            new_entries: list[tuple[str, str, str]] = []  # (video_id, rss_title, channel_title)
+            for cid in cid_by_handle.values():
+                for vid, title, channel_title in await self._fetch_rss(client, cid):
+                    if vid in self._seen_video_ids:
+                        continue
+                    self._seen_video_ids.add(vid)
+                    new_entries.append((vid, title, channel_title))
+
+            if not new_entries:
+                return []
+
+            # Classify new IDs (1 unit per ≤50 IDs)
+            meta = await self._classify(client, [e[0] for e in new_entries])
+
+            events: list[Event] = []
+            for vid, rss_title, channel_title in new_entries:
+                info = meta.get(vid)
+                if not info:
                     continue
-                out.extend(await self._check_live(client, handle, cid))
-                out.extend(await self._check_uploads(client, handle, cid))
-        return out
+                sn = info.get("snippet", {})
+                cd = info.get("contentDetails", {})
+                live_state = sn.get("liveBroadcastContent", "none")
+                duration = _iso_to_seconds(cd.get("duration", ""))
+                url = f"https://youtube.com/watch?v={vid}"
+                creator = sn.get("channelTitle") or channel_title or ""
+                title = sn.get("title") or rss_title
+
+                if live_state == "live":
+                    events.append(
+                        Event(
+                            platform="youtube",
+                            kind="live",
+                            creator=creator,
+                            title=title,
+                            url=url,
+                        )
+                    )
+                elif live_state == "none" and duration >= self.min_longform_seconds:
+                    events.append(
+                        Event(
+                            platform="youtube",
+                            kind="upload",
+                            creator=creator,
+                            title=title,
+                            url=url,
+                            duration_seconds=duration,
+                        )
+                    )
+                # skip "upcoming" (scheduled) and shorts (< min_longform_seconds)
+
+        return events
