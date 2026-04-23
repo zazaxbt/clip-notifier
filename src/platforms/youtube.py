@@ -1,15 +1,22 @@
-"""YouTube watcher using RSS feeds (free, no quota) + minimal API for classification.
+"""YouTube watcher using RSS feeds (free) + batched videos.list for classification.
 
-Quota footprint per poll cycle (8 channels):
+Quota per poll cycle (8 channels):
   - Channel-ID resolution: 0 units (scraped from @handle HTML, cached forever)
   - Recent-video discovery: 0 units (RSS feed per channel)
   - Classification of new IDs: 1 unit per videos.list call (batched up to 50 IDs)
 
-Well under the 10 000 unit/day default quota.
+Bug history:
+  - Videos are only marked "seen" AFTER a successful classify, so a quota
+    failure leaves them unseen and retries them on the next poll.
+  - Uploads older than `lookback_hours` are skipped (prevents a flood of
+    historical videos when Railway redeploys and the in-memory seen-set
+    resets). Live streams are never time-filtered — if someone's actually
+    live we always want to know.
 """
 from __future__ import annotations
 
 import re
+from datetime import datetime, timedelta, timezone
 from xml.etree import ElementTree as ET
 
 import httpx
@@ -37,12 +44,27 @@ def _iso_to_seconds(iso: str) -> int:
     return h * 3600 + mn * 60 + s
 
 
+def _parse_published(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
 class YouTubeWatcher(Platform):
     name = "youtube"
 
-    def __init__(self, api_key: str, min_longform_seconds: int = 600) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        min_longform_seconds: int = 600,
+        lookback_hours: int = 4,
+    ) -> None:
         self.api_key = api_key
         self.min_longform_seconds = min_longform_seconds
+        self.lookback = timedelta(hours=lookback_hours)
         self._channel_id_cache: dict[str, str] = {}
         self._seen_video_ids: set[str] = set()
 
@@ -71,8 +93,8 @@ class YouTubeWatcher(Platform):
 
     async def _fetch_rss(
         self, client: httpx.AsyncClient, channel_id: str
-    ) -> list[tuple[str, str, str]]:
-        """Return (video_id, title, channel_title) tuples for recent entries."""
+    ) -> list[tuple[str, str, str, datetime | None]]:
+        """Return (video_id, title, channel_title, published_at) tuples."""
         try:
             r = await client.get(RSS_URL.format(channel_id=channel_id))
             if r.status_code != 200:
@@ -82,19 +104,21 @@ class YouTubeWatcher(Platform):
             return []
         ct_elem = root.find("atom:title", NS)
         channel_title = ct_elem.text if ct_elem is not None else ""
-        out: list[tuple[str, str, str]] = []
+        out: list[tuple[str, str, str, datetime | None]] = []
         for entry in root.findall("atom:entry", NS):
             vid = entry.find("yt:videoId", NS)
             title = entry.find("atom:title", NS)
+            pub = entry.find("atom:published", NS)
             if vid is None or title is None or not vid.text:
                 continue
-            out.append((vid.text, title.text or "", channel_title or ""))
+            published_at = _parse_published(pub.text if pub is not None else None)
+            out.append((vid.text, title.text or "", channel_title or "", published_at))
         return out
 
     async def _classify(
         self, client: httpx.AsyncClient, video_ids: list[str]
     ) -> dict[str, dict]:
-        """Batch-classify video IDs via videos.list (1 unit per call, up to 50 IDs)."""
+        """Batch-classify via videos.list (1 unit per call, ≤50 IDs)."""
         if not video_ids or not self.api_key:
             return {}
         out: dict[str, dict] = {}
@@ -113,6 +137,8 @@ class YouTubeWatcher(Platform):
                 for item in r.json().get("items", []):
                     out[item["id"]] = item
             except Exception:
+                # Silently skip — caller treats missing metadata as "unclassified,
+                # retry on next poll" (video never gets added to _seen_video_ids).
                 continue
         return out
 
@@ -121,33 +147,37 @@ class YouTubeWatcher(Platform):
             return []
 
         async with httpx.AsyncClient(timeout=20) as client:
-            # Resolve handles → channel IDs (free, cached)
             cid_by_handle: dict[str, str] = {}
             for h in handles:
                 cid = await self._resolve_channel_id(client, h)
                 if cid:
                     cid_by_handle[h] = cid
 
-            # Collect new video IDs via RSS (free)
-            new_entries: list[tuple[str, str, str]] = []  # (video_id, rss_title, channel_title)
+            # Gather new video IDs via RSS (free)
+            candidates: list[tuple[str, str, str, datetime | None]] = []
             for cid in cid_by_handle.values():
-                for vid, title, channel_title in await self._fetch_rss(client, cid):
+                for vid, title, channel_title, pub_at in await self._fetch_rss(client, cid):
                     if vid in self._seen_video_ids:
                         continue
-                    self._seen_video_ids.add(vid)
-                    new_entries.append((vid, title, channel_title))
+                    candidates.append((vid, title, channel_title, pub_at))
 
-            if not new_entries:
+            if not candidates:
                 return []
 
-            # Classify new IDs (1 unit per ≤50 IDs)
-            meta = await self._classify(client, [e[0] for e in new_entries])
+            # Classify batched. If this fails for a given ID, we DO NOT add it to
+            # the seen-set — we'll retry next poll.
+            meta = await self._classify(client, [c[0] for c in candidates])
 
+            cutoff = datetime.now(timezone.utc) - self.lookback
             events: list[Event] = []
-            for vid, rss_title, channel_title in new_entries:
+
+            for vid, rss_title, channel_title, pub_at in candidates:
                 info = meta.get(vid)
                 if not info:
+                    # classify failed / returned nothing — leave unseen, retry next poll
                     continue
+                self._seen_video_ids.add(vid)
+
                 sn = info.get("snippet", {})
                 cd = info.get("contentDetails", {})
                 live_state = sn.get("liveBroadcastContent", "none")
@@ -157,6 +187,7 @@ class YouTubeWatcher(Platform):
                 title = sn.get("title") or rss_title
 
                 if live_state == "live":
+                    # Always emit live events regardless of age
                     events.append(
                         Event(
                             platform="youtube",
@@ -167,6 +198,9 @@ class YouTubeWatcher(Platform):
                         )
                     )
                 elif live_state == "none" and duration >= self.min_longform_seconds:
+                    # Filter out historical uploads to avoid flood on startup
+                    if pub_at and pub_at < cutoff:
+                        continue
                     events.append(
                         Event(
                             platform="youtube",
@@ -177,6 +211,5 @@ class YouTubeWatcher(Platform):
                             duration_seconds=duration,
                         )
                     )
-                # skip "upcoming" (scheduled) and shorts (< min_longform_seconds)
 
         return events
