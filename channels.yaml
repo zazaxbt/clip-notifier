@@ -1,0 +1,10 @@
+channels:
+  youtube:
+  - Mrbeast
+  twitch:
+  - kai_cenat
+  kick: []
+  x: []
+settings:
+  min_longform_seconds: 600
+  dedup_window_hours: 168
