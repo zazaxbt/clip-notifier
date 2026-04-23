@@ -1,50 +1,100 @@
-"""X / Twitter watcher — best-effort via snscrape."""
+"""X / Twitter watcher — Space detection via Nitter RSS (no auth, no API key).
+
+How it works:
+  - For each handle, fetch https://<nitter>/<handle>/rss (rotates across public
+    instances on failure).
+  - Parse the RSS; for each recent item, scan title + description for an
+    /i/spaces/<id> URL. That's the only signal we trust — we deliberately do
+    NOT match "live now"/"join me" text because it misses most Spaces and
+    produces false positives.
+  - Dedup Space IDs in-memory within the watcher instance; SQLite dedups at the
+    notifier level too.
+
+Caveats:
+  - Nitter instances come and go. Keep NITTER_INSTANCES fresh.
+  - Only detects Spaces the user tweets about. Silent Spaces (hosted without a
+    tweet) are invisible — same limitation as any public-web approach.
+"""
 from __future__ import annotations
 
-import asyncio
 import re
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
+from xml.etree import ElementTree as ET
+
+import httpx
 
 from .base import Event, Platform
 
-LIVE_PATTERNS = [
-    re.compile(r"twitter\.com/i/spaces/", re.I),
-    re.compile(r"x\.com/i/spaces/", re.I),
-    re.compile(r"\blive now\b", re.I),
-    re.compile(r"\bjoin me live\b", re.I),
-    re.compile(r"\bstreaming now\b", re.I),
-    re.compile(r"\bgoing live\b", re.I),
+NITTER_INSTANCES = [
+    "https://nitter.net",
+    "https://nitter.poast.org",
+    "https://nitter.privacydev.net",
+    "https://nitter.cz",
+    "https://nitter.tiekoetter.com",
 ]
 
-
-def _looks_live(text: str) -> bool:
-    return any(p.search(text) for p in LIVE_PATTERNS)
+SPACE_URL_RE = re.compile(r"(?:twitter\.com|x\.com)/i/spaces/([A-Za-z0-9]+)", re.I)
 
 
 class XWatcher(Platform):
     name = "x"
 
-    def __init__(self, lookback_minutes: int = 15) -> None:
+    def __init__(self, lookback_minutes: int = 120) -> None:
         self.lookback = timedelta(minutes=lookback_minutes)
+        self._seen_space_ids: set[str] = set()
+        self._working_instance: str | None = None
 
-    def _scrape_sync(self, handle: str, since: datetime) -> list[tuple[str, str, str]]:
+    async def _fetch_rss(self, client: httpx.AsyncClient, handle: str) -> str | None:
+        """Try instances in order; return the first successful RSS body."""
+        order = list(NITTER_INSTANCES)
+        if self._working_instance and self._working_instance in order:
+            order.remove(self._working_instance)
+            order.insert(0, self._working_instance)
+        for base in order:
+            try:
+                r = await client.get(
+                    f"{base}/{handle}/rss",
+                    headers={"User-Agent": "Mozilla/5.0 (clip-notifier)"},
+                )
+                if r.status_code == 200 and r.text.lstrip().startswith("<?xml"):
+                    self._working_instance = base
+                    return r.text
+            except Exception:
+                continue
+        return None
+
+    def _parse_space_hits(
+        self, rss_text: str, since: datetime
+    ) -> list[tuple[str, str, str]]:
+        """Return (space_id, title, space_url) for recent tweets containing Spaces."""
         try:
-            import snscrape.modules.twitter as sntwitter  # type: ignore
-        except Exception:
+            root = ET.fromstring(rss_text)
+        except ET.ParseError:
+            return []
+        channel = root.find("channel")
+        if channel is None:
             return []
         out: list[tuple[str, str, str]] = []
-        try:
-            scraper = sntwitter.TwitterUserScraper(handle)
-            for i, tweet in enumerate(scraper.get_items()):
-                if i > 20:
-                    break
-                if tweet.date < since:
-                    break
-                content = tweet.rawContent or ""
-                if _looks_live(content):
-                    out.append((str(tweet.id), content, f"https://x.com/{handle}/status/{tweet.id}"))
-        except Exception:
-            return []
+        for item in channel.findall("item"):
+            pub_elem = item.find("pubDate")
+            if pub_elem is None or not pub_elem.text:
+                continue
+            try:
+                pub = parsedate_to_datetime(pub_elem.text)
+            except (TypeError, ValueError):
+                continue
+            if pub.tzinfo is None:
+                pub = pub.replace(tzinfo=timezone.utc)
+            if pub < since:
+                continue
+            title = (item.findtext("title") or "").strip()
+            desc = item.findtext("description") or ""
+            m = SPACE_URL_RE.search(f"{title}\n{desc}")
+            if not m:
+                continue
+            space_id = m.group(1)
+            out.append((space_id, title, f"https://x.com/i/spaces/{space_id}"))
         return out
 
     async def poll(self, handles: list[str]) -> list[Event]:
@@ -52,18 +102,23 @@ class XWatcher(Platform):
             return []
         since = datetime.now(timezone.utc) - self.lookback
         events: list[Event] = []
-        loop = asyncio.get_running_loop()
-        for handle in handles:
-            clean = handle.lstrip("@")
-            hits = await loop.run_in_executor(None, self._scrape_sync, clean, since)
-            for tid, content, url in hits:
-                events.append(
-                    Event(
-                        platform="x",
-                        kind="live",
-                        creator=f"@{clean}",
-                        title=content[:140],
-                        url=url,
+        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+            for handle in handles:
+                clean = handle.lstrip("@")
+                rss = await self._fetch_rss(client, clean)
+                if not rss:
+                    continue
+                for space_id, title, space_url in self._parse_space_hits(rss, since):
+                    if space_id in self._seen_space_ids:
+                        continue
+                    self._seen_space_ids.add(space_id)
+                    events.append(
+                        Event(
+                            platform="x",
+                            kind="live",
+                            creator=f"@{clean}",
+                            title=title[:200] or f"Space by @{clean}",
+                            url=space_url,
+                        )
                     )
-                )
         return events
