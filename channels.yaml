@@ -1,4 +1,4 @@
-channels:
+ channels:
   youtube:
     - Orangieyt
     - TJRTrades
@@ -41,7 +41,8 @@ channels:
 mentions:
   - Clavicular
   - ishowspeed
-  -  loganpaul 
+  - loganpaul 
+  - Kevin O'Leary
 settings:
   min_longform_seconds: 600
   dedup_window_hours: 168
