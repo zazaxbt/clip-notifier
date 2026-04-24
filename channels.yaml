@@ -8,6 +8,7 @@
     - impaulsive
     - PBBlakeYT
     - UpOnly
+    - ShaneStoffer
   twitch:
     - orangieyt
     - tjrtrades
@@ -38,11 +39,13 @@
     - MitchOnSOL_
     - Clavicular0
     - ishowspeedsui 
+    - ShaneStoffer
 mentions:
   - Clavicular
   - ishowspeed
   - loganpaul 
   - Kevin O'Leary
+  - Togi
 settings:
   min_longform_seconds: 600
   dedup_window_hours: 168
