@@ -37,10 +37,11 @@ channels:
     - HsakaTrades
     - MitchOnSOL_
     - Clavicular0
-
+    - ishowspeedsui 
 mentions:
   - Clavicular
-
+  - ishowspeed
+  -  loganpaul 
 settings:
   min_longform_seconds: 600
   dedup_window_hours: 168
